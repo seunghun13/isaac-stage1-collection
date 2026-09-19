@@ -1,0 +1,24 @@
+{
+  "status": "verified_review_package",
+  "created_at_utc": "2026-09-19T01:35:52.493212+00:00",
+  "copied_files": 67,
+  "copied_files_byte_identical": 65,
+  "packaging_only_changes": [
+    "ORIGIN.json relative path separators",
+    "LOCAL_VERIFICATION.json regenerated in package"
+  ],
+  "python_sources_parsed": 49,
+  "offline_synthetic_tests_passed": 7,
+  "source_regression_checks_passed": true,
+  "source_files_unchanged": true,
+  "support_source_release_hashes_checked": true,
+  "four_scene_config_hashes_match_last_scene_build": true,
+  "package_relative_origin_paths_resolve": true,
+  "server_contacted": false,
+  "deployed": false,
+  "isaac_runtime_verified": false,
+  "thirty_second_recording_completed": false,
+  "included": "QR-free code, QR baseline for comparison, support code/configuration, selected evidence, review documentation",
+  "excluded": "credentials/SSH config, Isaac installation, USD assets, raw bag/video, third-party binaries, full mro_runtime installation",
+  "file_count_including_manifest_and_this_report": 70
+}

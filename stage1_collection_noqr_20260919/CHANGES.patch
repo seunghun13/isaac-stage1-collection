@@ -1,0 +1,549 @@
+--- qr_baseline/record_runtime.py
++++ noqr/record_runtime.py
+@@ -1,8 +1,14 @@
+-"""One finite Stage1 acquisition; native clocks are observed, never rewritten."""
++"""QR-free Stage1 acquisition; retain the pilot clock and rendering sequence."""
+ import asyncio,hashlib,json,os,socket,threading,time,traceback
+ import numpy as np
+ from record_common import M,S,C,CAMERAS,SIZES,MAX_QUEUE_BYTES,safe,save,frame_parts,validate_spec
+ from record_probe import plain
++
++def assert_qr_free_stage(stage):
++    """Reject active validation fixtures left in a reused scene."""
++    for prim in stage.Traverse():
++        if str(prim.GetPath())=='/Stage1ValidationMarkers' or prim.GetName().startswith('ValidationTimeBoard_'):
++            raise ValueError('QR fixture remains; a fresh QR-free Stage1 scene is required')
+ 
+ class Emitter:
+     def __init__(self,port):
+@@ -64,14 +70,12 @@
+     from pxr import Gf,UsdGeom,UsdPhysics,PhysxSchema
+     from isaacsim.core.simulation_manager import SimulationManager
+     from isaacsim.core.nodes.bindings import _isaacsim_core_nodes
+-    from scene_markers import SceneMarkers
+-    from drone_board import DroneBoard
+-    from marker_codec import decode_marker
+     from record_lidar import Reader
+     from record_render import ManualRendering
+     import stage1_scene,waypoint_motion
+     case=safe(request['case']);spec=validate_spec(json.loads((case/'spec.json').read_text()))
+     assert spec['launch_id']==os.environ['MRO_LAUNCH_ID'] and not timeline.is_playing()
++    assert_qr_free_stage(stage)
+     run_dir=safe(os.environ['MRO_VIEW_RUN'])
+     with (run_dir/'collection_consumed.json').open('x') as f:json.dump({'case':str(case)},f)
+     original=stage.GetSessionLayer().ExportToString();old_view=viewport.updates_enabled
+@@ -102,13 +106,6 @@
+         tc=stage.GetPrimAtPath('/World/drone_1/base_link/TrackingCenter')
+         zero=UsdGeom.XformCache().GetLocalToWorldTransform(tc).ExtractTranslation()
+         move.Set(Gf.Vec3d(*route['waypoints_m'][0])-zero)
+-        tc_matrix=UsdGeom.XformCache().GetLocalToWorldTransform(tc)
+-        board_world=Gf.Matrix4d(*[x for row in cams[1]['T_world_optical_row'] for x in row])
+-        board_world.SetTranslateOnly(tc_matrix.ExtractTranslation()+Gf.Vec3d(0,0,1.5))
+-        board=DroneBoard(stage,{'board_id':102,'cell_size_m':.08,'cell_depth_offset_m':.002,'target_camera':'cam_02',
+-              'T_tracking_center_board_row':stage1_scene.matrix_rows(board_world*tc_matrix.GetInverse()),
+-              'search_roi_xyxy':[0,0,cams[1]['width'],cams[1]['height']]},spec['epoch'])
+-        markers=SceneMarkers(stage,cams,spec['epoch'])
+         physics=UsdPhysics.Scene.Define(stage,'/Stage1CollectionClock');physics.CreateGravityMagnitudeAttr(0.)
+         api=PhysxSchema.PhysxSceneAPI.Apply(physics.GetPrim());api.CreateTimeStepsPerSecondAttr(60)
+         api.CreateEnableGPUDynamicsAttr(False);api.CreateBroadphaseTypeAttr('MBP')
+@@ -150,13 +147,14 @@
+             if warm%5==0:save(case/'progress.json',{'phase':'warmup','index':warm,'total':30})
+         origin=clock();origin['stamp_ns']=round(origin['global_s']*1e9)
+         report.update(cameras=cams,trajectory=trajectory,trajectory_config=route,origin=origin,static_transforms=transforms,
+-              lidar=lidar.metadata,scene_markers=markers.metadata,drone_board=board.metadata,
+-              time_contract={'camera_header':'observed SimulationManager global seconds rounded to ns; checked against QR and native camera annotators',
++              lidar=lidar.metadata,scene_markers={'enabled':False},drone_board={'enabled':False},
++              qr_verification={'status':'not_performed_qr_removed','image_content_time_verified':None},
++              time_contract={'camera_header':'observed SimulationManager global seconds rounded to ns; native camera annotators retained; image-content time not checked',
+                              'lidar_header':'unaltered native packet timestampNs; not global acquisition time',
+                              'bag_record_time':'DDS callback wall time','route_t0_global_s':origin['global_s'],
+-                             'qr_value':'observed global physics step, looked up in state mapping','no_flight_dynamics':True,
++                             'qr_value':None,'no_flight_dynamics':True,
+                              'camera_stride':4,'physics_hz':60,'pointcloud':'valid native elements, original native indices/times; no deskew'},
+-              online_qr={c:{'match':0,'unreadable':0,'mismatch':0} for c in CAMERAS},state_count=0,image_count=0,lidar_count=0,lidar_unavailable=0)
++              state_count=0,image_count=0,lidar_count=0,lidar_unavailable=0)
+         stage.GetSessionLayer().Export(str(case/'recording_session.usda'))
+         emitter=Emitter(json.loads((case/'publisher_ready.json').read_text())['port']);emitter.offer(dict(report,type='config'))
+         save(case/'producer_report.json',plain(report))
+@@ -166,7 +164,7 @@
+             current=clock();assert current['step']==origin['step']+i
+             if i:assert abs(current['global_s']-previous['global_s']-1/60)<1e-7
+             route_s=current['global_s']-origin['global_s'];sample=waypoint_motion.sample(trajectory,route_s)
+-            move.Set(Gf.Vec3d(*sample['position_m'])-zero);markers.update(current['step']);board.update(current['step'])
++            move.Set(Gf.Vec3d(*sample['position_m'])-zero)
+             lidar_events.clear();capture_lidar=True
+             complete=manual.next_complete()
+             await omni.kit.app.get_app().next_update_async()
+@@ -189,10 +187,7 @@
+                     assert pixels.dtype==np.uint8 and pixels.shape==(cam['height'],cam['width'],3)
+                     body=pixels.tobytes();cid=cam['camera_id'];rawref=plain(ref.get_data())
+                     ref_s=float(core.get_sim_time_at_time((int(rawref['referenceTimeNumerator']),int(rawref['referenceTimeDenominator']))))
+-                    decoded=decode_marker(pixels,markers.metadata['cameras'][cid]['layout'])
+-                    match=decoded.get('valid') and decoded.get('tick')==current['step'] and decoded.get('epoch')==spec['epoch']
+-                    report['online_qr'][cid]['match' if match else ('mismatch' if decoded.get('valid') else 'unreadable')]+=1
+-                    h=dict(base,type='image',camera_id=cid,reference=rawref,reference_sim_s=ref_s,native_simulation_time=plain(native.get_data()),online_qr=decoded)
++                    h=dict(base,type='image',camera_id=cid,reference=rawref,reference_sim_s=ref_s,native_simulation_time=plain(native.get_data()))
+                     if spec['mode']=='smoke':h['source_sha256']=hashlib.sha256(body).hexdigest()
+                     emitter.offer(h,body);report['image_count']+=1
+             previous=current
+--- qr_baseline/record_common.py
++++ noqr/record_common.py
+@@ -65,6 +65,7 @@
+     if x['resolution'] not in ('native','probe'):raise ValueError('Resolution')
+     if type(x['wall_timeout_s']) is not int or not 180<=x['wall_timeout_s']<=7200:raise ValueError('Finite wall bound')
+     if x['color_plane_enabled'] is not False or x['lidar_enabled'] is not True:raise ValueError('Required sensor scope')
++    if x.get('qr_boards_enabled') is not False:raise ValueError('This version requires explicit qr_boards_enabled=false')
+     if not 0<=x['epoch']<2**32:raise ValueError('Epoch')
+     safe(x['case'])
+     return x
+--- qr_baseline/analyze_bag.py
++++ noqr/analyze_bag.py
+@@ -1,14 +1,15 @@
+-"""Read-only bag verification independent of producer QR decisions."""
++"""Read-only QR-free bag checks; image-content timing remains unobserved."""
+ import collections,hashlib,json,math,sqlite3,sys,time
+ from pathlib import Path
+ import numpy as np
+ from rosbags.typesys import Stores,get_typestore
+-from marker_codec import decode_marker
+-from board_vision import detect_board
++from timing_assessment import frame_clock_checks,assess_run
+ 
+ case=Path(sys.argv[1]);root=Path('/mnt/DATA/workspace/ws_minho/mro_1/stage1')
+ assert case.resolve()==case and case.is_relative_to(root/'outputs')
+ spec=json.loads((case/'spec.json').read_text());producer=json.loads((case/'producer_report.json').read_text())
++assert spec.get('qr_boards_enabled') is False
++assert producer['scene_markers']['enabled'] is False and producer['drone_board']['enabled'] is False
+ paths=list((case/'bag').glob('*.db3'));assert len(paths)==1
+ dbpath=paths[0];before=dbpath.stat();db=sqlite3.connect('file:'+str(dbpath)+'?mode=ro&immutable=1',uri=True)
+ integrity=db.execute('PRAGMA quick_check').fetchall();assert integrity==[('ok',)]
+@@ -24,7 +25,6 @@
+ states={h['index']:h for h in mapping if h['type']=='state'}
+ images={(h['camera_id'],h['stamp_ns']):h for h in mapping if h['type']=='image'}
+ lidars=[h for h in mapping if h['type']=='lidar']
+-lookup={h['clock']['step']:h['stamp_ns'] for h in states.values()}
+ session=json.loads(next(messages('/stage1/session'))[1].data)
+ pub=json.loads((case/'publisher_done.json').read_text());sub=json.loads((case/'subscriber_done.json').read_text())
+ result={'case':str(case),'sqlite_integrity':'ok','bytes':sum(p.stat().st_size for p in (case/'bag').iterdir() if p.is_file()),
+@@ -46,8 +46,8 @@
+ for cid in ('cam_01','cam_02','cam_03'):
+     infos={ns(m.header):m for _,m in messages('/stage1/cameras/'+cid+'/camera_info')}
+     cal=next(c for c in producer['cameras'] if c['camera_id']==cid)
+-    report={'images':0,'reference_valid':0,'reference_unreadable':0,'reference_mismatch':0,
+-            'drone_valid':0,'drone_unreadable':0,'drone_mismatch':0,'image_rows':[],
++    report={'images':0,'metadata_time_failures':0,'sample_indices':[],'image_rows':[],
++            'qr_status':'not_performed_qr_removed',
+             'reference_global_max_error_ns':0,'native_annotator_global_max_error_ns':0,'source_hash_checks':0}
+     previous=-1
+     for _,msg in messages('/stage1/cameras/'+cid+'/image_raw'):
+@@ -59,23 +59,15 @@
+         pixels=np.asarray(msg.data,dtype=np.uint8).reshape(msg.height,msg.width,3)
+         if meta.get('source_sha256'):
+             assert hashlib.sha256(pixels).hexdigest()==meta['source_sha256'];report['source_hash_checks']+=1
+-        decoded=decode_marker(pixels,producer['scene_markers']['cameras'][cid]['layout'])
+-        match=decoded['valid'] and decoded['epoch']==spec['epoch'] and decoded['camera_id']==int(cid[-2:]) and lookup.get(decoded['tick'])==stamp
+-        report['reference_valid' if decoded['valid'] else 'reference_unreadable']+=1
+-        report['reference_mismatch']+=int(decoded['valid'] and not match)
+-        row={'index':meta['index'],'stamp_ns':stamp,'reference':decoded,'reference_match':bool(match)}
+-        if producer['drone_board']['enabled']:
+-            board=detect_board(pixels,[0,0,msg.width,msg.height],producer['drone_board'])
+-            code=board.get('decoded',board.get('code',{}))
+-            # Current independent decoder returns its payload in `decode`.
+-            if not code:code=board.get('decode',{})
+-            valid=bool(board.get('valid'));good=valid and code.get('epoch')==spec['epoch'] and lookup.get(code.get('tick'))==stamp
+-            report['drone_valid' if valid else 'drone_unreadable']+=1;report['drone_mismatch']+=int(valid and not good)
+-            row['drone']={'valid':valid,'status':board.get('status'),'code':code,'match':bool(good)}
+-        report['reference_global_max_error_ns']=max(report['reference_global_max_error_ns'],abs(round(meta['reference_sim_s']*1e9)-stamp))
+-        report['native_annotator_global_max_error_ns']=max(report['native_annotator_global_max_error_ns'],abs(round(meta['native_simulation_time']['simulationTime']*1e9)-stamp))
++        timing=frame_clock_checks(stamp,meta,states[meta['index']])
++        report['metadata_time_failures']+=int(not timing['metadata_time_pass'])
++        report['sample_indices'].append(meta['index'])
++        row={'index':meta['index'],'stamp_ns':stamp,'metadata_timing':timing}
++        report['reference_global_max_error_ns']=max(report['reference_global_max_error_ns'],timing['reference_global_error_ns'])
++        report['native_annotator_global_max_error_ns']=max(report['native_annotator_global_max_error_ns'],timing['native_annotator_global_error_ns'])
+         report['images']+=1;report['image_rows'].append(row)
+     assert report['images']==spec['ticks']//4+1 and len(infos)==report['images']
++    report['sample_sequence_pass']=report.pop('sample_indices')==list(range(0,spec['ticks']+1,spec['camera_stride']))
+     result['cameras'][cid]=report
+ lidar_report={'packets':0,'points':0,'outside_native_frame_points':0,'native_frame_deltas':[],
+               'reference_global_max_error_ns':0,'native_minus_global_observation_ns':[],
+@@ -104,9 +96,7 @@
+ lidar_report['native_minus_global_observation_range_ns']=[min(offsets),max(offsets)] if offsets else None
+ result['lidar']=lidar_report
+ result['static_tf_count']=len(next(messages('/tf_static'))[1].transforms);assert result['static_tf_count']==5
+-result['camera_time_pass']=all(c['reference_valid']>0 and c['reference_mismatch']==0 and c['drone_mismatch']==0 and c['reference_global_max_error_ns']<=1000 and c['native_annotator_global_max_error_ns']<=1000 for c in result['cameras'].values())
+-result['transport_pass']=result['counts_match_publisher_dds_bag'] and not producer['cleanup_errors']
+-result['synchronized_dataset_pass']=result['camera_time_pass'] and result['transport_pass'] and result['lidar_acquisition_time_verified']
++result.update(assess_run(result['cameras'],result['clock_checks'],result['counts_match_publisher_dds_bag'],producer['cleanup_errors']))
+ after=dbpath.stat();assert before.st_size==after.st_size and before.st_mtime_ns==after.st_mtime_ns
+ result['read_only_bag_unchanged_stat']=True
+ hashobj=hashlib.sha256()
+--- qr_baseline/run_record.py
++++ noqr/run_record.py
+@@ -1,6 +1,6 @@
+ """Launch and monitor one fresh bounded Stage1 recording."""
+ from pathlib import Path
+-import json,sys,time,uuid
++import hashlib,json,sys,time,uuid
+ from ops import D,source
+ label=sys.argv[1];ticks=int(sys.argv[2]) if len(sys.argv)>2 else 12
+ resolution=sys.argv[3] if len(sys.argv)>3 else 'native'
+@@ -25,9 +25,16 @@
+ rid=uuid.uuid4().hex
+ spec={'schema':'stage1_recording_v1','mode':'smoke' if ticks<=60 else ('pilot' if ticks==300 else 'route'),
+       'ticks':ticks,'physics_hz':60,'camera_stride':4,'resolution':resolution,'wall_timeout_s':wall,
+-      'color_plane_enabled':False,'lidar_enabled':True,'epoch':int(rid[:8],16),'request_id':rid}
+-launch=json.loads(source(PRE+'SPEC='+repr(spec)+'\nLABEL='+repr(label)+'\n'+'''
++      'color_plane_enabled':False,'qr_boards_enabled':False,'lidar_enabled':True,'epoch':int(rid[:8],16),'request_id':rid}
++expected_sources={name:hashlib.sha256((D/name).read_bytes()).hexdigest() for name in (
++    'record_runtime.py','record_common.py','record_render.py','record_lidar.py','record_probe.py',
++    'record_worker.py','record_driver.py','timing_assessment.py','waypoints.json')}
++launch=json.loads(source(PRE+'SPEC='+repr(spec)+'\nLABEL='+repr(label)+'\nEXPECTED_SOURCES='+repr(expected_sources)+'\n'+'''
++import hashlib
+ from record_common import validate_spec
++for name,expected in EXPECTED_SOURCES.items():
++    path=C/name
++    assert path.resolve(strict=True)==path and hashlib.sha256(path.read_bytes()).hexdigest()==expected,'Deploy this QR-free version before recording: '+name
+ assert not (run/'collection_consumed.json').exists()
+ owner=read_json(M,run/'owner.json');assert owner['status']=='running'
+ stage=read_json(M,run/'stage_status.json');assert not stage['recording'] and not stage['timeline_playing']
+@@ -48,14 +55,14 @@
+ for name in ('progress.json','producer_report.json','driver_report.json','publisher_done.json','subscriber_done.json','publish_error.json','subscribe_error.json'):
+     if (case/name).exists():
+         d=read_json(M,case/name)
+-        result[name]=d if name not in ('producer_report.json','driver_report.json') else {k:d[k] for k in ('status','error','traceback','online_qr','state_count','image_count','lidar_count','resources') if k in d}
++        result[name]=d if name not in ('producer_report.json','driver_report.json') else {k:d[k] for k in ('status','error','traceback','qr_verification','state_count','image_count','lidar_count','resources') if k in d}
+         if name=='driver_report.json' and 'resources' in result[name]:result[name]['resources']=result[name]['resources'][-1:]
+ result['gpu']=gpu_snapshot();result['cpu']=_top_header()
+ print(json.dumps(result))
+ '''));samples.append(result)
+     (D/(label+'_monitor.json')).write_text(json.dumps(samples),encoding='utf-8')
+     print(json.dumps({'progress':result.get('progress.json'),'driver':result.get('driver_report.json',{}).get('status'),
+-                      'producer':{k:v for k,v in result.get('producer_report.json',{}).items() if k in ('status','error','online_qr')},
++                      'producer':{k:v for k,v in result.get('producer_report.json',{}).items() if k in ('status','error','qr_verification')},
+                       'gpu1':result['gpu']['devices']['1'],'cpu_idle':result['cpu']['idle_percent']}),flush=True)
+     final=result.get('driver_report.json',{}).get('status')
+     if final in ('complete','failed'):break
+--- qr_baseline/deploy.py
++++ noqr/deploy.py
+@@ -12,6 +12,7 @@
+     'collection_20260918_v1/record_worker.py':D/'record_worker.py',
+     'collection_20260918_v1/record_runtime.py':D/'record_runtime.py',
+     'collection_20260918_v1/record_driver.py':D/'record_driver.py',
++    'collection_20260918_v1/timing_assessment.py':D/'timing_assessment.py',
+     'collection_20260918_v1/waypoints.json':D/'waypoints.json',
+     'scripts/view_hangar_bootstrap.py':D/'view_hangar_bootstrap.py',
+ }.items():
+--- /dev/null
++++ noqr/timing_assessment.py
+@@ -0,0 +1,45 @@
++"""Metadata-only timing checks; these cannot certify the time of image pixels."""
++import math
++
++
++def frame_clock_checks(stamp_ns, metadata, state, tolerance_ns=1000):
++    times = (metadata['reference_sim_s'],
++             metadata['native_simulation_time']['simulationTime'],
++             metadata['clock']['global_s'], state['clock']['global_s'])
++    if not all(math.isfinite(float(value)) for value in times):
++        raise ValueError('Nonfinite camera clock')
++    stamp_ns = int(stamp_ns)
++    reference_error = abs(round(float(times[0])*1e9)-stamp_ns)
++    native_error = abs(round(float(times[1])*1e9)-stamp_ns)
++    mapping_matches = (
++        metadata['index'] == state['index']
++        and metadata['clock']['step'] == state['clock']['step']
++        and int(metadata['stamp_ns']) == int(state['stamp_ns']) == stamp_ns
++        and round(float(times[2])*1e9) == round(float(times[3])*1e9) == stamp_ns
++    )
++    return {
++        'mapping_matches_state': mapping_matches,
++        'reference_global_error_ns': reference_error,
++        'native_annotator_global_error_ns': native_error,
++        'metadata_time_pass': mapping_matches and max(reference_error, native_error) <= tolerance_ns,
++    }
++
++
++def assess_run(cameras, clock_checks, counts_match, cleanup_errors):
++    metadata_pass = (
++        set(cameras) == {'cam_01', 'cam_02', 'cam_03'}
++        and clock_checks['strictly_increasing']
++        and clock_checks['header_global_max_error_ns'] == 0
++        and all(c['images'] > 0 and c['sample_sequence_pass']
++                and c['metadata_time_failures'] == 0 for c in cameras.values())
++    )
++    return {
++        'camera_metadata_time_pass': metadata_pass,
++        'camera_content_time_status': 'not_checked_qr_removed',
++        'camera_content_time_verified': None,
++        # The old field included an independent QR check. Do not relabel it as a pass.
++        'camera_time_pass': None,
++        'transport_pass': bool(counts_match) and not cleanup_errors,
++        'lidar_acquisition_time_verified': False,
++        'synchronized_dataset_pass': False,
++    }
+--- /dev/null
++++ noqr/test_timing_assessment.py
+@@ -0,0 +1,85 @@
++"""Synthetic regressions for truthful timing reports; no Isaac, ROS or SSH."""
++import copy
++import math
++import unittest
++from timing_assessment import frame_clock_checks, assess_run
++
++
++def sample(index):
++    # The observed pilot clock advances by float32(1/60), not exact decimal 1/60.
++    global_s = (index+2)*0.01666666753590107
++    stamp = round(global_s*1e9)
++    state = {'index': index, 'stamp_ns': stamp,
++             'clock': {'global_s': global_s, 'step': index+2}}
++    metadata = dict(copy.deepcopy(state), reference_sim_s=global_s,
++                    native_simulation_time={'simulationTime': global_s})
++    return stamp, metadata, state
++
++
++def summary():
++    cameras = {cid: {'images': 451, 'sample_sequence_pass': True, 'metadata_time_failures': 0}
++               for cid in ('cam_01', 'cam_02', 'cam_03')}
++    clocks = {'strictly_increasing': True, 'header_global_max_error_ns': 0}
++    return cameras, clocks
++
++
++class TimingAssessmentTests(unittest.TestCase):
++    def test_thirty_second_synthetic_clock_keeps_all_451_sample_headers(self):
++        for index in range(0, 1801, 4):
++            with self.subTest(index=index):
++                self.assertTrue(frame_clock_checks(*sample(index))['metadata_time_pass'])
++
++    def test_one_step_old_native_or_reference_time_fails(self):
++        for field in ('native', 'reference'):
++            stamp, metadata, state = sample(60)
++            if field == 'native':
++                metadata['native_simulation_time']['simulationTime'] -= 1/60
++            else:
++                metadata['reference_sim_s'] -= 1/60
++            with self.subTest(field=field):
++                self.assertFalse(frame_clock_checks(stamp, metadata, state)['metadata_time_pass'])
++
++    def test_wrong_clock_join_or_header_fails(self):
++        for field in ('index', 'step', 'stamp', 'global'):
++            stamp, metadata, state = sample(60)
++            if field == 'index': metadata['index'] -= 4
++            elif field == 'step': metadata['clock']['step'] -= 1
++            elif field == 'stamp': stamp += 1
++            else: metadata['clock']['global_s'] -= 1/60
++            with self.subTest(field=field):
++                self.assertFalse(frame_clock_checks(stamp, metadata, state)['metadata_time_pass'])
++
++    def test_nonfinite_clocks_cannot_pass(self):
++        for value in (math.nan, math.inf, -math.inf):
++            stamp, metadata, state = sample(60)
++            metadata['reference_sim_s'] = value
++            with self.assertRaises(ValueError): frame_clock_checks(stamp, metadata, state)
++
++    def test_good_metadata_never_certifies_image_pixels_or_lidar(self):
++        # Identical metadata can accompany stale pixels; no QR-free metadata check detects that.
++        result = assess_run(*summary(), True, [])
++        self.assertTrue(result['camera_metadata_time_pass'])
++        self.assertTrue(result['transport_pass'])
++        self.assertIsNone(result['camera_content_time_verified'])
++        self.assertIsNone(result['camera_time_pass'])
++        self.assertFalse(result['lidar_acquisition_time_verified'])
++        self.assertFalse(result['synchronized_dataset_pass'])
++
++    def test_missing_duplicate_or_bad_timing_sample_fails_metadata_summary(self):
++        for fault in ('missing_camera', 'sequence', 'frame', 'reversal', 'header'):
++            cameras, clocks = summary()
++            if fault == 'missing_camera': cameras.pop('cam_03')
++            elif fault == 'sequence': cameras['cam_01']['sample_sequence_pass'] = False
++            elif fault == 'frame': cameras['cam_01']['metadata_time_failures'] = 1
++            elif fault == 'reversal': clocks['strictly_increasing'] = False
++            else: clocks['header_global_max_error_ns'] = 1
++            with self.subTest(fault=fault):
++                self.assertFalse(assess_run(cameras, clocks, True, [])['camera_metadata_time_pass'])
++
++    def test_loss_and_cleanup_failure_remain_transport_failures(self):
++        for counts, errors in ((False, []), (True, ['detach failed'])):
++            self.assertFalse(assess_run(*summary(), counts, errors)['transport_pass'])
++
++
++if __name__ == '__main__':
++    unittest.main()
+--- /dev/null
++++ noqr/verify_local.py
+@@ -0,0 +1,120 @@
++"""Offline source regression and synthetic tests. Never imports a remote launcher."""
++from pathlib import Path
++import ast
++import copy
++import datetime
++import hashlib
++import io
++import json
++import sys
++import unittest
++
++D = Path(__file__).resolve().parent
++W = D.parent
++origin = json.loads((D/'ORIGIN.json').read_text(encoding='utf-8'))
++checks = {}
++
++def digest(path):
++    return hashlib.sha256(path.read_bytes()).hexdigest()
++
++checks['original_local_sources_preserved'] = all(
++    digest(W/item['source']) == item['sha256'] for item in origin['files'].values())
++unchanged = ('record_render.py', 'record_worker.py', 'record_driver.py',
++             'record_lidar.py', 'record_probe.py', 'waypoints.json',
++             'stage1_scene.py', 'view_hangar_bootstrap.py')
++checks['render_ros_lidar_driver_scene_route_byte_identical'] = all(
++    digest(D/name) == origin['files'][name]['sha256'] for name in unchanged)
++syntax = [p.name for p in D.glob('*.py')]
++for name in syntax:
++    ast.parse((D/name).read_text(encoding='utf-8'), filename=name)
++checks['all_python_sources_parse'] = True
++
++old = ast.parse((W/origin['files']['record_runtime.py']['source']).read_text(encoding='utf-8'))
++new = ast.parse((D/'record_runtime.py').read_text(encoding='utf-8'))
++
++def named(tree, name):
++    return next(n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and n.name == name)
++
++def dump(tree):
++    return ast.dump(tree, include_attributes=False)
++
++for name in ('Emitter', 'pointcloud', 'clock', 'render', 'on_frame'):
++    checks[name+'_unchanged_ast'] = dump(named(old, name)) == dump(named(new, name))
++
++def acquisition_loop(tree):
++    return next(n for n in ast.walk(named(tree, 'run'))
++                if isinstance(n, ast.For) and ast.unparse(n.iter) == "range(spec['ticks'] + 1)")
++
++class RemoveQrOnly(ast.NodeTransformer):
++    def visit_Expr(self, node):
++        if isinstance(node.value, ast.Call) and ast.unparse(node.value.func) in ('markers.update', 'board.update'):
++            return None
++        return self.generic_visit(node)
++
++    def visit_Assign(self, node):
++        if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name) and node.targets[0].id in ('decoded', 'match'):
++            return None
++        return self.generic_visit(node)
++
++    def visit_AugAssign(self, node):
++        if ast.unparse(node.target).startswith("report['online_qr']"):
++            return None
++        return self.generic_visit(node)
++
++    def visit_Call(self, node):
++        node = self.generic_visit(node)
++        if isinstance(node.func, ast.Name) and node.func.id == 'dict':
++            node.keywords = [k for k in node.keywords if k.arg != 'online_qr']
++        return node
++
++checks['entire_acquisition_loop_unchanged_except_qr'] = (
++    dump(RemoveQrOnly().visit(copy.deepcopy(acquisition_loop(old)))) == dump(acquisition_loop(new)))
++for variable in ('warm', 'cam'):
++    # Warmup loop and camera RenderProduct/annotator construction must retain their order and settings.
++    def selected(tree):
++        return next(n for n in ast.walk(named(tree, 'run')) if isinstance(n, ast.For)
++                    and isinstance(n.target, ast.Name) and n.target.id == variable
++                    and (variable == 'warm' or ast.unparse(n.iter) == 'cams'))
++    checks[variable+'_setup_loop_unchanged_ast'] = dump(selected(old)) == dump(selected(new))
++for tree_name, tree in (('runtime', new), ('analyzer', ast.parse((D/'analyze_bag.py').read_text(encoding='utf-8')))):
++    checks[tree_name+'_no_qr_imports_or_constructors'] = not any(
++        isinstance(n, ast.ImportFrom) and n.module in ('scene_markers', 'drone_board', 'marker_codec', 'board_vision')
++        or isinstance(n, ast.Call) and ast.unparse(n.func) in ('SceneMarkers', 'DroneBoard', 'decode_marker', 'detect_board')
++        for n in ast.walk(tree))
++
++# Execute the actual residual-fixture guard against a tiny stage API double.
++guard_module = ast.Module(body=[copy.deepcopy(named(new, 'assert_qr_free_stage'))], type_ignores=[])
++namespace = {}
++exec(compile(ast.fix_missing_locations(guard_module), '<guard-only>', 'exec'), namespace)
++class Prim:
++    def __init__(self, path): self.path = path
++    def GetPath(self): return self.path
++    def GetName(self): return self.path.rsplit('/', 1)[-1]
++class Stage:
++    def __init__(self, paths): self.paths = paths
++    def Traverse(self): return (Prim(p) for p in self.paths)
++guard = namespace['assert_qr_free_stage']
++guard(Stage(['/World/drone_1/base_link/TrackingCenter', '/MRO_Cameras/cam_01']))
++rejected = []
++for path in ('/Stage1ValidationMarkers', '/World/drone_1/base_link/TrackingCenter/ValidationTimeBoard_102'):
++    try: guard(Stage([path]))
++    except ValueError: rejected.append(path)
++checks['residual_camera_and_drone_fixtures_rejected'] = len(rejected) == 2
++
++sys.path.insert(0, str(D))
++from test_timing_assessment import TimingAssessmentTests
++stream = io.StringIO()
++tests = unittest.TextTestRunner(stream=stream, verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(TimingAssessmentTests))
++checks['synthetic_timing_regressions_pass'] = tests.wasSuccessful()
++report = {'status': 'local_checks_passed' if all(checks.values()) else 'failed',
++          'utc': datetime.datetime.now(datetime.timezone.utc).isoformat(),
++          'checks': checks, 'synthetic_tests': tests.testsRun, 'test_output': stream.getvalue(),
++          'python_files_parsed': len(syntax), 'source_sha256': {n: digest(D/n) for n in sorted(syntax)},
++          'server_contacted': False, 'deployed': False, 'isaac_runtime_tested': False,
++          'image_content_time_equivalence_verified': False,
++          'lidar_acquisition_time_verified': False}
++(D/'LOCAL_VERIFICATION.json').write_text(json.dumps(report, indent=2), encoding='utf-8')
++print(json.dumps({k:v for k,v in report.items() if k not in ('source_sha256', 'test_output')}, indent=2))
++if not all(checks.values()):
++    print(stream.getvalue())
++    raise SystemExit(1)
+--- /dev/null
++++ noqr/README.md
+@@ -0,0 +1,51 @@
++# Stage1 QR 제거 수집 버전 — 2026-09-19
++
++로컬에서 작성한 QR 제거 버전이다. 서버에 접속하거나 배포하지 않았고 Isaac Sim으로 실행하지 않았다. 기존 `stage1_collection_20260918` 코드와 수집 데이터는 그대로 보존했다. 마지막 서버 상태는 2026-09-18 사용자 요청에 따른 Isaac Sim 종료·SSH 연결 종료다.
++
++드론 부착 QR판과 카메라 화면의 기준 QR판을 모두 생성하지 않는다. QR 셀 업데이트와 온라인·사후 판독도 제거했다. 색 평판은 계속 꺼져 있다. 기존 장면에 활성 QR판이 남아 있으면 수집을 거부한다. 새로 열린 Stage1 장면을 사용해야 한다.
++
++## 타임스탬프에 대해 유지한 것
++
++- 글로벌 시각은 기존과 동일하게 SimulationManager에서 실제 관측한다. 60Hz로 한 스텝씩 전진하며 카메라는 4스텝마다 읽는다.
++- 카메라 Image·CameraInfo, 드론 GT 및 `/clock`의 헤더 생성·발행 방법을 유지했다. 카메라 native simulationTime, ReferenceTime 및 `/stage1/time_mapping`도 보존한다.
++- LiDAR NEW_FRAME 취득 → 글로벌 시계를 전진시키지 않는 Replicator 카메라 완료 대기 → RGB 읽기 순서를 유지했다. 초기화와 30회 예열도 유지한다.
++- LiDAR native 헤더·점별 원시 시각, DDS 수신 wall time을 그대로 기록한다. LiDAR 시각 보정은 추가하지 않았다.
++- 원본 해상도 3카메라, GT 60Hz, 이미지 15시뮬Hz, 14토픽, 기존 왕복 경로를 유지한다. 30초는 1,800스텝이며 시작·끝 포함 카메라마다 451장이다.
++
++따라서 **타임스탬프 규칙과 수집 순서는 QR 버전과 같다**고 소스 수준에서 확인할 수 있다. 별도 세션의 절대 시작 시각, wall time, 실행 속도까지 동일하다는 뜻은 아니다.
++
++**QR 없는 실제 영상의 내용 시각이 동일하게 맞는지는 아직 실행 검증하지 않았다.** QR은 시계가 아니라 영상에 보이는 시각 표식이었다. 제거하면 렌더링 부하·장면 내용이 바뀌며, 메타데이터가 일치해도 오래된 RGB가 섞였는지 독립 판독할 수 없다. QR 제거에 따라 가림·반사와 LiDAR의 검출 점도 달라질 수 있다. 기존 QR 시험은 기존 버전의 근거로 보존하며 새 버전의 실측 합격으로 재사용하지 않는다.
++
++## 결과 판정
++
++`analyze_bag.py`는 원본 bag을 읽기 전용으로 열고 토픽 수·전달 수·시계 단조성·이미지 시퀀스·헤더/시계 매핑·native/ReferenceTime 수치·LiDAR 원시 payload와 점 시각을 검사한다. QR가 없는 이미지를 판독 불가로 세거나 QR 검증을 통과했다고 기록하지 않는다.
++
++| 필드 | 의미 |
++|---|---|
++| `camera_metadata_time_pass` | 저장된 시각 메타데이터 및 샘플 순서 검사 결과 |
++| `camera_content_time_status` | `not_checked_qr_removed` |
++| `camera_content_time_verified` | `null`: 이번 영상 내용의 시각은 독립 검증하지 않음 |
++| `camera_time_pass` | `null`: 기존 QR 포함 종합 판정은 적용하지 않음 |
++| `lidar_acquisition_time_verified` | `false`: 기존 점별 취득 시각 미검증 상태 유지 |
++| `synchronized_dataset_pass` | `false`: 전체 센서 취득 시각 합격으로 표시하지 않음 |
++
++## 코드 검토 순서
++
++1. `record_runtime.py`: 장면 준비, 시계 전진, 렌더 완료, 센서 읽기 및 IPC.
++2. `record_render.py`: 렌더 완료 이벤트와 annotator 평가. 기존 버전과 바이트 단위 동일하다.
++3. `record_worker.py`: native rclpy 발행, 별도 DDS 구독, rosbag2 SQLite 저장. 기존 버전과 바이트 단위 동일하다.
++4. `analyze_bag.py`와 `timing_assessment.py`: QR 없는 자료의 검증 범위와 판정.
++5. `waypoints.json`, `stage1_scene.py`: 이동 경로와 장면. 기존 버전과 바이트 단위 동일하다.
++6. `CHANGES.patch`, `ORIGIN.json`, `LOCAL_VERIFICATION.json`: 기존 버전과의 차이 및 로컬 검사 근거.
++
++Isaac Sim·USD·ROS 2 라이브러리, 장면/센서 에셋, 기존 Stage1 supervisor·좌표 보조 모듈은 이 폴더에 포함된 독립 설치본이 아니다. `record_common.py`의 원격 경로는 기존 Stage1 설치 위치를 가리킨다. 소스 검토는 로컬에서 가능하며 실제 실행에는 해당 환경이 필요하다.
++
++## 로컬 검사와 향후 실행
++
++`python -B verify_local.py`는 네트워크나 Isaac Sim 없이 구문·원본 해시·수집 루프·렌더/발행 소스 동일성과 합성 시각 회귀를 검사한다. 실제 30초 영상을 생성하거나 시간 동기화를 실측하는 시험은 아니다.
++
++`ops.py`, `deploy.py`, `run_record.py`, `run_analysis.py`, `run_replay.py`는 기존 서버 운용용 코드의 사본이다. 로컬 검토 과정에서는 실행하지 않았다. 향후 사용자가 서버 재접속을 요청하면 자원 확인, 기존 owned 세션 종료 확인, 배포 전 archive와 해시 검증, 새 세션 시작 절차를 거쳐야 한다. 새 launcher는 수집 전 서버 소스가 이 QR 제거 버전과 일치하는지 확인한다.
++
++30초 route 모드의 기존 `record_driver.py` 실행 제한도 변경하지 않았다. `synchronized_dataset_pass=true`를 요구하므로 현재 저장된 acceptance로는 route 수집이 차단된다. 원시 자료 수집 허용과 전체 동기화 검증 합격을 구분하는 실행 정책 정리는 별도 후속 작업이다. 이번 QR 제거 변경을 이유로 검증 상태를 true로 바꾸지 않는다.
++
++서버 재사용 시에는 먼저 QR 없는 짧은 시험으로 실제 QR 부재, 정상 렌더 완료, 누락·중복 없는 시퀀스, 시각 메타데이터 일치와 자원을 확인하는 것이 적절하다. 이는 새 버전의 기본 실행 검사이며, 이미지 내용 시각에 대한 QR 기반 직접 증명과는 검증 범위가 다르다.

@@ -1,0 +1,76 @@
+{
+  "created_at_utc": "2026-09-19T01:18:48.920881+00:00",
+  "source_version": "stage1_collection_20260918",
+  "server_contacted": false,
+  "deployed": false,
+  "files": {
+    "record_runtime.py": {
+      "source": "stage1_collection_20260918/record_runtime.py",
+      "sha256": "bf0dadb5541620e7c6adf5990352399104d7f9a18bec551f543877ad5c13ca51"
+    },
+    "record_common.py": {
+      "source": "stage1_collection_20260918/record_common.py",
+      "sha256": "69b85147aae81ef3a8148c75fea68f64865a964c734d7d38c8b941defe0cd609"
+    },
+    "record_render.py": {
+      "source": "stage1_collection_20260918/record_render.py",
+      "sha256": "1cdfa214dafb3beac52489e0a05ff2a63bb11cd0af18f8a9a4a214b4da9550bf"
+    },
+    "record_lidar.py": {
+      "source": "stage1_collection_20260918/record_lidar.py",
+      "sha256": "fab76a61dcc5540028db6274fba3ab3119a475a3f9df04b6979af7531f1d0f8a"
+    },
+    "record_probe.py": {
+      "source": "stage1_collection_20260918/record_probe.py",
+      "sha256": "12618dfe8a0dc6d419a1b316700887b0e0b6f851a4fa85c403b5d1eb8dcc8f75"
+    },
+    "record_worker.py": {
+      "source": "stage1_collection_20260918/record_worker.py",
+      "sha256": "2e27f3b9cf347ecdd9a4d9630214ad165969d7ff308429e762bf7917eb4067d0"
+    },
+    "record_driver.py": {
+      "source": "stage1_collection_20260918/record_driver.py",
+      "sha256": "fce9cb3c44326280a000731def5562997c7f8a5d75b28672a320f2196f595e97"
+    },
+    "waypoints.json": {
+      "source": "stage1_collection_20260918/waypoints.json",
+      "sha256": "08649c68dfbef81be0d6dfed117349a25815c731159417ad6b4c6e245b5f7fac"
+    },
+    "analyze_bag.py": {
+      "source": "stage1_collection_20260918/analyze_bag.py",
+      "sha256": "5fe2dfc3fc1d415e27a22f8336ffc7adde7171bff4d2d1e7d4a1dc2fed7e38d7"
+    },
+    "run_record.py": {
+      "source": "stage1_collection_20260918/run_record.py",
+      "sha256": "50108394d50ba82fdeb24bebeb182ecff354f2b40402685391d8e9f05df0076a"
+    },
+    "run_analysis.py": {
+      "source": "stage1_collection_20260918/run_analysis.py",
+      "sha256": "ed0191e12b2c79e7a9f9416e97535119fcf83ec752ed77b2feb5585465bde819"
+    },
+    "run_replay.py": {
+      "source": "stage1_collection_20260918/run_replay.py",
+      "sha256": "17090fe73684087cfcfe0b85b36ae029a2e5c49b819391350cbbb629a7651fdb"
+    },
+    "replay_worker.py": {
+      "source": "stage1_collection_20260918/replay_worker.py",
+      "sha256": "2417d352e5e43c298973b3c27e1311c1846b90a360b939c9a2d8bde9ef6cac6b"
+    },
+    "ops.py": {
+      "source": "stage1_collection_20260918/ops.py",
+      "sha256": "754f48cdc435c9aa75204f0d2916b8fe3392935875aa825e02027d3ef5d142e4"
+    },
+    "deploy.py": {
+      "source": "stage1_collection_20260918/deploy.py",
+      "sha256": "eeb8bad5a191488ce0e4db9236d95ce9a3129b105dfde3b7c36a571673335ad2"
+    },
+    "view_hangar_bootstrap.py": {
+      "source": "stage1_collection_20260918/view_hangar_bootstrap.py",
+      "sha256": "6795329e20639f29ffe16bddb982b4ebd1c3de38ef7cacca8d51feee8449c8ca"
+    },
+    "stage1_scene.py": {
+      "source": "stage1_collection_20260918/stage1_scene.py",
+      "sha256": "f732a5a4eaf0a10ec818e97a010da2be48e47e8c69aba0c734db722c49b1d4b4"
+    }
+  }
+}
